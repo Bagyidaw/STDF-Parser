@@ -1,0 +1,8 @@
+Revision history for STDF-Parser
+
+0.01    09/21/2024
+        First version, released on an unsuspecting world.
+        STDF v4 is most widely used data format.
+        This library is written in pure perl and the only dependency is perl version 5.10 and above.
+        
+
