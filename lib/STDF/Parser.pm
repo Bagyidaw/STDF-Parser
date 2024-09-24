@@ -9,7 +9,6 @@ use Scalar::Util qw(openhandle);
 use Carp;
 
 
-
 use constant {
     FAR   =>   0 <<8 | 10,
     ATR   =>   0 <<8 | 20,
@@ -143,7 +142,7 @@ sub new {
       if(ref($ex_rec) eq "ARRAY") {
         @exclude = @$ex_rec;
       } 
-      elsif(ref($ex_rec) eq "SCALAR") {
+      elsif(ref($ex_rec) eq "") {
         @exclude = map { uc($_) } split /\s*,\s*/,$ex_rec;
       }
     }
@@ -160,7 +159,6 @@ sub new {
         $own_fh = 1;
     }
     binmode($fh) or die "Cannot change binmode:$!";
-
     my $buf;
     my $nread = read($fh,$buf,6);
     if(!defined($nread)) { die "Reading from file failed:$!"; }
@@ -211,9 +209,6 @@ sub new {
         7 => $REAL,
         8 => $R8,
         10=> "C/a",
-        11=> "C/a",
-        12=> "C/a",
-        13=> "h"
     );
     my %size_table = (
             "C/a" => 'str',
@@ -627,26 +622,61 @@ sub new {
             # V* n
             ## data type is in 1st byte
             for(1..$fld_cnt) {
-                my $type = unpack("x2 C",$data);
+                my $type = unpack("x${consumed} C",$data);
                 $consumed += 1;
                 if($type == 0) {
                     #push @a,$type; # dun return padding
                     next; 
                 }
-                unless( exists($gdr_type_table{$type})) {
-                    die "Error parsing GDR: wrong GEN_DATA type $type\n";
-                }
-                my $type_fmt = $gdr_type_table{$type};
-                my $v = unpack("x${consumed} $type_fmt",$data);
-                my $s;
-                if($type >= 10 && $type <= 12) {
-                    $s = length($v);
-                } 
-                else {
-                    $s = $size_table{$type_fmt};
-                }
-                $consumed += $s;
+               # unless( exists($gdr_type_table{$type})) {
+                #    die "Error parsing GDR: wrong GEN_DATA type $type\n";
+               # }
+			   my $v;
+			    if(exists($gdr_type_table{$type}) ) {
+					my $type_fmt = $gdr_type_table{$type};
+					$v = unpack("x${consumed} $type_fmt",$data);
+					my $s;
+					if($type ==10 ) {
+						$s = length($v) +1;
+					} 
+					else {
+						$s = $size_table{$type_fmt};
+					}
+					$consumed += $s;
+				}
+				elsif($type == 11) {
+					### B*n variable length bit encoded field
+					## 1st byte unsigned count of BYTES to follow
+					my $cnt = unpack("x${consumed}C",$data);
+					$consumed += 1 + $cnt;
+					$v = substr($data,$consumed,$cnt);
+					
+				}
+				elsif($type == 12) {
+					## D*n bit encoded data  
+					## fist 2 bytes of strings are length in *bits*
+					my $bit_length = unpack("x${consumed} $UNSIGN_SHORT",$data);
+					$consumed +=2;
+					if($bit_length) {
+					my $byte_cnt = int($bit_length/8) ;
+					if( $bit_length %8 ) { $byte_cnt++;}
+					my @array = unpack("x${consumed} C${byte_cnt}",$data);
+					$v = [@array];
+					$consumed +=  scalar(@array);
+					}
+				}
+				elsif($type == 13) {
+					## N*1 unsigned nibble 
+					## only whole byte can be written to STDF
+					$v = unpack("x{$consumed} C",$data);
+					$consumed++;
+
+				}
+				else {
+					die "Error parsing GDR: Invallid GEN_DATA type $type at rec # $rec_num\n";
+				}
                 push @a,$type,$v;
+				
             
             }
         }
@@ -723,7 +753,7 @@ sub new {
             else {
                 for(1..3) {
                     if($len > $consumed) {
-                        push @a,unpack("x{$consumed} $REAL",$data);
+                        push @a,unpack("x${consumed} $REAL",$data);
                         $consumed += 4;
                     }
                 }
@@ -740,12 +770,12 @@ sub new {
                 }
                 if($len > $consumed) {
                     my $v = unpack("x${consumed} $SIGN_SHORT",$data);
-                    push @a,v
+                    push @a,$v;
                     $consumed += 2;
                 }
                 if($len > $consumed) {
                     my $v = unpack("x${consumed} $SIGN_SHORT",$data);
-                    push @a,v
+                    push @a,$v;
                     $consumed += 2;
                 }
                 if($len > $consumed) {
