@@ -80,11 +80,11 @@ STDF::Parser -   STDF::Parser to parse STDF Version 4 in pure Perl!
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 
 =head1 SYNOPSIS
@@ -119,6 +119,14 @@ Quick summary of what the module does.
      exclude_records   - array ref of record names or comma separated record names to exclude 
               any of the record in STDF in exclude_records will not be returned by parser
       
+    omit_optional_fields - boolean if set, parser will not return optional fields of PTR
+
+                to quote from STDF v4 spec
+                All data following the OPT_FLAG field has a special function in the STDF file. The first
+                PTR for each test will have these fields filled in. These values will be the default for each
+                subsequent PTR with the same test number: if a subsequent PTR has a value for one of
+                these fields, it will be used instead of the default, for that one record only; if the field is
+                blank, the default will be used.  
 
      my $p = STDF::Parser->new( stdf => $fh, exclude_records => 'PTR,FTR,MPR');
      my $rec_stream = $p->stream;
@@ -136,6 +144,7 @@ sub new {
       die "Missing required argument stdf \n";
     }
     my @exclude;
+    my $omit_optional_field = 0;
     if(exists($args{exclude_records})) {
 
       my $ex_rec = $args{exclude_records};
@@ -145,6 +154,10 @@ sub new {
       elsif(ref($ex_rec) eq "") {
         @exclude = map { uc($_) } split /\s*,\s*/,$ex_rec;
       }
+    }
+
+    if(exists($args{omit_optional_fields})) {
+        $omit_optional_field = $args{omit_optional_fields};
     }
     my $file = $args{stdf};
     my %exclude_records = map { $_ =>1} @exclude;
@@ -230,6 +243,8 @@ sub new {
     my $ptr_fixed_template = "(L C2 C C )${endian_fmt}";
     my $ptr_opt_template   = "(C c3 f f)${endian_fmt}";
     my $prr_fixed_template = "CC C${UNSIGN_SHORT}2 ";
+    my %ptr_opt_data;  # per test num
+    my %ptr_default; 
     my $obj;
     my $parser = sub {
         
@@ -272,6 +287,7 @@ sub new {
                 push @a, unpack("x8 $REAL",$data);
             }
             $consumed = 12;
+           
             my $val;
             if($consumed < $len )
             {
@@ -288,7 +304,34 @@ sub new {
                 push @a,$val;
             }
             my $remain_len = $len - $consumed;
+            ## OPT_FLG to end
             if($remain_len != 0) {
+                my $tnum=$a[0];
+                my $remain_data = substr($data,$consumed);
+                ## if caller requests not to return option part of PTR for subsequent PTR
+                ## after default is returned; and current opt part of PTR,if present, is same as default
+                ## some STDF PTR contains optional part for every part
+                if($omit_optional_field) {
+                    if(exists($ptr_opt_data{$tnum})) {
+                        if($remain_data eq $ptr_opt_data{$tnum}) {
+                            $consumed += length($remain_data);
+                            #print "PTR cache for $tnum hit!\n";
+                            goto RETURN;
+                        }
+                        my $curlen=length($remain_data);
+                        my $def_len = length($ptr_opt_data{$tnum});
+                    # my $fs = $ptr_default{$tnum};
+                        #my $s = join "|",@$fs;
+                        #print "not same as cache miss for $tnum Curr $curlen $def_len\n";
+                        #print "default ptr:$s\n";
+                    } else {
+                        $ptr_opt_data{$a[0]} = substr($data,$consumed);
+                        ## must use \@a not [@a] so we can see updated @a 
+                        $ptr_default{$tnum} = \@a;
+                        #print "PTR first tnum $tnum\n";
+                    }
+                }
+            
             if($remain_len >= 12) {
                 push @a,unpack($ptr_opt_template,substr($data,$consumed));
                 $consumed += 12;
