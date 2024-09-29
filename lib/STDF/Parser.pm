@@ -80,11 +80,11 @@ STDF::Parser -   STDF::Parser to parse STDF Version 4 in pure Perl!
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 
 =head1 SYNOPSIS
@@ -119,6 +119,15 @@ Quick summary of what the module does.
      exclude_records   - array ref of record names or comma separated record names to exclude 
               any of the record in STDF in exclude_records will not be returned by parser
       
+    omit_optional_fields - boolean if set, parser will not return optional fields of PTR, 
+                        optional fields for PTR are fields following OPT_FLAG.
+
+                to quote from STDF v4 spec
+                All data following the OPT_FLAG field has a special function in the STDF file. The first
+                PTR for each test will have these fields filled in. These values will be the default for each
+                subsequent PTR with the same test number: if a subsequent PTR has a value for one of
+                these fields, it will be used instead of the default, for that one record only; if the field is
+                blank, the default will be used.  
 
      my $p = STDF::Parser->new( stdf => $fh, exclude_records => 'PTR,FTR,MPR');
      my $rec_stream = $p->stream;
@@ -136,6 +145,7 @@ sub new {
       die "Missing required argument stdf \n";
     }
     my @exclude;
+    my $omit_optional_field = 0;
     if(exists($args{exclude_records})) {
 
       my $ex_rec = $args{exclude_records};
@@ -145,6 +155,10 @@ sub new {
       elsif(ref($ex_rec) eq "") {
         @exclude = map { uc($_) } split /\s*,\s*/,$ex_rec;
       }
+    }
+
+    if(exists($args{omit_optional_fields})) {
+        $omit_optional_field = $args{omit_optional_fields};
     }
     my $file = $args{stdf};
     my %exclude_records = map { $_ =>1} @exclude;
@@ -198,7 +212,6 @@ sub new {
     {
         die "Error in parsing FAR record: wrong FAR record length ($far_len) ";
     }
-    my $BIT = "B";
     my %gdr_type_table = (
         1 => "C",
         2 => $UNSIGN_SHORT,
@@ -230,6 +243,11 @@ sub new {
     my $ptr_fixed_template = "(L C2 C C )${endian_fmt}";
     my $ptr_opt_template   = "(C c3 f f)${endian_fmt}";
     my $prr_fixed_template = "CC C${UNSIGN_SHORT}2 ";
+    my %ptr_opt_data;  # per test num
+    my %ptr_default; 
+    my %mpr_opt_data; # per test num Perhaps one hash should be enough for MPR and PTR 
+                      # can the same test number appear in PTR & MPR? should be no..
+    my %mpr_default;
     my $obj;
     my $parser = sub {
         
@@ -245,7 +263,7 @@ sub new {
         }
     LOOP : while( $n = read($fh,$buf,4) ) {
         if($n != 4) {
-            die "Parser error reading record header, get $n bytes expecting 4\n";
+            die "Parser error reading record header at position $num_bytes_read, get $n bytes expecting 4\n";
         }
         ($len,$typ,$sub) = unpack($HEADER_TMPL,$buf);
         $num_bytes_read += 4;
@@ -253,7 +271,7 @@ sub new {
         
         if(!defined($actual_read) || $actual_read != $len)
         {
-            die "Parsing typ($typ), sub($sub): expects to read $len at record #$rec_num";
+            die "Parsing typ($typ), sub($sub): expects to read $len at position $num_bytes_read record #$rec_num";
         }
         $num_bytes_read += $len;
         $rec_num += 1;
@@ -272,6 +290,7 @@ sub new {
                 push @a, unpack("x8 $REAL",$data);
             }
             $consumed = 12;
+           
             my $val;
             if($consumed < $len )
             {
@@ -288,7 +307,31 @@ sub new {
                 push @a,$val;
             }
             my $remain_len = $len - $consumed;
+            ## OPT_FLG to end
             if($remain_len != 0) {
+                my $tnum=$a[0];
+                ## if caller requests not to return option part of PTR for subsequent PTR
+                ## after default is returned; and current opt part of PTR,if present, is same as default
+                ## some STDF PTR contains optional part for every part
+                {
+                    ## +1 skip OPT_FLG
+                    my $remain_data = substr($data,$consumed+1);
+
+                    if(exists($ptr_opt_data{$tnum})) {
+                        if($omit_optional_field && $remain_data eq $ptr_opt_data{$tnum}) {
+                            push @a,unpack("x${consumed} C",$data);
+                            $consumed += length($remain_data)+1;
+                            #print "PTR cache for $tnum hit!\n";
+                            goto RETURN;
+                        }
+                    } else {
+                        $ptr_opt_data{$a[0]} = $remain_data;
+                        ## must use \@a not [@a] so we can see updated @a 
+                        $ptr_default{$tnum} = \@a;
+                        #print "PTR first tnum $tnum\n";
+                    }
+                }
+            
             if($remain_len >= 12) {
                 push @a,unpack($ptr_opt_template,substr($data,$consumed));
                 $consumed += 12;
@@ -377,9 +420,11 @@ sub new {
             ## RTN_STAT 
             ## j x N*1 nibble 
             if($rtn_icnt) {
-            my $nibble_cnt = int($rtn_icnt /2) + ($rtn_icnt%2);
-            push @a , [unpack("x${consumed} C${nibble_cnt}",$data)] ;
-            $consumed += $nibble_cnt;
+                push @a, unpack("x${consumed} h${rtn_icnt}",$data);
+                my $byte_cnt = int($rtn_icnt/2)+ ($rtn_icnt%2);
+                $consumed += $byte_cnt;
+            } else {
+                push @a,'';
             }
             ### PGM_INDX
             if($consumed >= $len) { goto RETURN;}
@@ -388,10 +433,13 @@ sub new {
 
             if($consumed >= $len) { goto RETURN;}
             ### PGM_STAT
+            ## Nibble N*1 vec
             if($pgm_icnt) {
-            my $pgm_nibble_cnt = int($pgm_icnt/2) + ($pgm_icnt%2);
-            push @a, [ unpack("x${consumed} C${pgm_nibble_cnt}",$data)];
-            $consumed += $pgm_nibble_cnt;
+            my $byte_cnt = int($pgm_icnt/2) + ($pgm_icnt%2);
+            push @a, [ unpack("x${consumed} h${pgm_icnt}",$data)];
+            $consumed += $byte_cnt;
+            } else {
+                push @a,[];
             }
             if($consumed >= $len) { goto RETURN;}
             ## fail pin D*n
@@ -404,6 +452,8 @@ sub new {
                 my @fail_pin_vec = unpack("x${consumed} C${byte_cnt}",$data);
                 push @a, [@fail_pin_vec];
                 $consumed +=  scalar(@fail_pin_vec);
+            } else {
+                push @a,[];
             }
             ## VECT_NAM TIME_SET etc 7 C*n
             for(1..7) { 
@@ -427,6 +477,8 @@ sub new {
                 my @dn = unpack("x${consumed} C${bcount}",$data);
                 push @a,[@dn];
                 $consumed +=scalar(@dn);
+                } else {
+                    push @a,[];
                 }
             }
             
@@ -437,7 +489,7 @@ sub new {
             my $v;
             my ($rtnt_icnt,$rslt_cnt);
             if($consumed >= $len) {
-                goto MPR_DONE;
+                goto RETURN;
             }
             
             $v = unpack("x${consumed} $UNSIGN_SHORT",$data);
@@ -445,40 +497,59 @@ sub new {
             $consumed += 2;
             $rtnt_icnt = $v;
             
-            if($consumed >= $len) { goto MPR_DONE;}
+            if($consumed >= $len) { goto RETURN;}
             $v = unpack("x${consumed} $UNSIGN_SHORT",$data);
             push @a,$v;
             $consumed += 2;
             $rslt_cnt = $v;
            # print "MPR j = $rtnt_icnt k = $rslt_cnt\n";
-            if($consumed >= $len) { goto MPR_DONE; }
+            if($consumed >= $len) { goto RETURN; }
             ## N*1  nibble= 4 bits of byte 
-            ## only whoe byte can be written to STDF
+            ## only whole byte can be written to STDF
             if($rtnt_icnt) {
-            my $nibble_cnt = int($rtnt_icnt /2) + ($rtnt_icnt %2);
+            my $byte_cnt = int($rtnt_icnt /2) + ($rtnt_icnt %2);
             ## ie. nibble count 5 -> 3 
-            push @a, [unpack("x${consumed} C${rtnt_icnt}",$data)];
-            $consumed += $nibble_cnt;
+            push @a, unpack("x${consumed} h${rtnt_icnt}",$data);
+            $consumed += $byte_cnt;
+            } else {
+                push @a,'';
             }
-            if($consumed >= $len) { goto MPR_DONE;}
+            if($consumed >= $len) { goto RETURN;}
             push @a, [unpack("x${consumed} (${REAL})${rslt_cnt}",$data)];
             $consumed += 4 * $rslt_cnt;  # REAL 4 bytes
             #print "consumed so far before TEST_TXT $consumed\n";
-            if($consumed >= $len) { goto MPR_DONE ; }
+            if($consumed >= $len) { goto RETURN ; }
             ## TEST_TXT C*n
             $v = unpack("x${consumed} C/a",$data);
             $consumed += length($v) + 1;
             push @a,$v;
             ## ALARM_ID C*n
-            if($consumed >= $len) { goto MPR_DONE; }
+            if($consumed >= $len) { goto RETURN; }
             $v = unpack("x${consumed} C/a",$data);
             $consumed += length($v) + 1;
             push @a,$v;
 
-            if($consumed >= $len) { goto MPR_DONE; }
+            if($consumed >= $len) { goto RETURN; }
             ## OPT_FLAG to INCR_IN
             my $template = "C ccc $REAL $REAL $REAL $REAL";
             my $remaining = $len - $consumed;
+            if($remaining != 0) {
+                ## +1 skip OPT_FLG
+                my $remain_data = substr($data,$consumed+1);
+                my $tnum = $a[0];
+                if(exists($mpr_opt_data{$tnum})) {
+                    if($omit_optional_field && $remain_data eq $mpr_opt_data{$tnum}) {
+                        push @a,unpack("x${consumed} C",$data); ## OPT_FLG
+                        $consumed += length($remain_data)+1;
+                        goto RETURN;
+                    }
+                } else {
+                    $mpr_opt_data{$a[0]} = $remain_data;
+                    ## must use \@a not [@a] so we can see updated @a 
+                    $mpr_default{$tnum} = \@a;
+                }
+
+            }
             if($remaining >= 20) {
                 push @a, unpack("x${consumed} $template",$data);
                 $consumed += 20;
@@ -506,7 +577,7 @@ sub new {
                 }
             }
 
-            if($consumed >= $len) { goto MPR_DONE; }
+            if($consumed >= $len) { goto RETURN; }
             ### RTN_INDX jxU2
             push @a, [unpack("x${consumed} ${UNSIGN_SHORT}${rtnt_icnt}",$data)];
             $consumed += 2*$rtnt_icnt;
@@ -529,7 +600,6 @@ sub new {
                 $consumed += 4;
 
             }
-            MPR_DONE:
             
         }
         # PIR
@@ -592,7 +662,7 @@ sub new {
                 if($count) {
                 my $bit_vector = substr($data,$consumed+1,$count);
                 if(length($bit_vector) != $count) {
-                    die "Error in parsing PRR record: PART_FIX field.\n";
+                    die "Error in parsing PRR record: PART_FIX field. position $num_bytes_read record # $rec_num\n";
                 }
 
                 push @a, $bit_vector if($count);
@@ -628,10 +698,7 @@ sub new {
                     #push @a,$type; # dun return padding
                     next; 
                 }
-               # unless( exists($gdr_type_table{$type})) {
-                #    die "Error parsing GDR: wrong GEN_DATA type $type\n";
-               # }
-			   my $v;
+			    my $v;
 			    if(exists($gdr_type_table{$type}) ) {
 					my $type_fmt = $gdr_type_table{$type};
 					$v = unpack("x${consumed} $type_fmt",$data);
@@ -668,12 +735,12 @@ sub new {
 				elsif($type == 13) {
 					## N*1 unsigned nibble 
 					## only whole byte can be written to STDF
-					$v = unpack("x{$consumed} C",$data);
+					$v = unpack("x{$consumed} h",$data);
 					$consumed++;
 
 				}
 				else {
-					die "Error parsing GDR: Invallid GEN_DATA type $type at rec # $rec_num\n";
+					die "Error parsing GDR: Invallid GEN_DATA type $type at position $num_bytes_read rec # $rec_num\n";
 				}
                 push @a,$type,$v;
 				
@@ -957,14 +1024,14 @@ sub new {
                 $consumed += $size_table{$item};
             }
         }
-      # records not implemented yet..
+      # records not implemented yet or unknown type
      else {
            # return [$name,$typ,$sub,$data];
             return $obj->handle_unk_record($typ,$sub,$data);
        }
        RETURN:
        if($len != $consumed) {
-            die "Error parsing record $name rec num $rec_num at $num_bytes_read position : rec len ($len) parsed record ($consumed)\n";
+            die "Error parsing record $name rec num $rec_num at position $num_bytes_read : rec len ($len) parsed record ($consumed)\n";
        }
        unshift @a,$name;
         return [@a];
@@ -973,7 +1040,7 @@ sub new {
     close($fh) if($own_fh);
     $done = 1;
     if(!defined($n)) {
-        die "Read Error in parsing\n";
+        die "Read Error in parsing at position $num_bytes_read rec # $rec_num\n";
     }
     return undef;
     };
@@ -986,6 +1053,8 @@ sub new {
         _FileHandle => $fh,
         _Own_FileHandle => $own_fh,
         _done_flag    => \$done,
+        _ptr_default_values => \%ptr_default, # contains semi-static info for PTR
+        _mpr_default_values => \%mpr_default,  # contains semi-static info for MPR
     };
     bless($obj,$class);
     return $obj;
@@ -1079,7 +1148,10 @@ sub stream
   return data type is array ref 
      [ REC_NAME, Field1,field2, ... fieldn]
   atomic value like U1,U2,I1,I2,I4,R4 occupy as one element of type Perl SCALAR in array
-  C*n data type  translates to perl string
+  C*n data type return as perl string
+  N*1 data type return hexadecimal digit 0-9,a-F 
+  j*N*1 return string of hexadecimal digits 
+  D*n return array of bytes
   array field value are encoded to array ref of respective type
   Unknown record type REC_NAME is 'NA', follow by rec_typ,rec_sub, rec_body
 
@@ -1094,8 +1166,10 @@ sub get_next_record
 }
 
 =head2 handle_unk_record
+
   This method is place holder for subclasses to override parser behavior for unknown record
   default implementation is to return ["NA",rec_typ,rec_sub,rec_body]
+
 
 =cut
 
@@ -1106,6 +1180,97 @@ sub handle_unk_record
   ["NA",$typ,$sub,$record_body];
 
 }
+
+=head2 ptr_default_values
+
+
+    This method returns current semi-static fields of PTR. normally this method should be called after getting first part.
+    semi-static fields are defined as fields after OPT_FLAG to HI_SPEC
+    if no argument, return array of values, each value is array ref of 
+    [ test_num,res_scal,llm_scal, ..., lo_spec,hi_spec ], array element may be undef
+
+    if argument is array of test numbers, return array of array ref, 
+    the method returns same number of input argument, undef if no corresponding default value for test number
+
+
+    my @ptr_defaults = $p->ptr_default_values;
+    for my $opt_ptr(@ptr_defaults) {
+        my ($tnum,$res_scal) = @$opt_ptr;
+    }
+
+    my @ptr_defaults = $p->ptr_default_values( @tnums);
+    ## scalar(@ptr_defaults) == scalar(@tnums)
+
+=cut
+
+sub ptr_default_values
+{
+    my $self = shift;
+    my $ptr_default_ref = $self->{_ptr_default_values};
+    # is hash ref key = tnum value 1st PTR with all fields 
+    my @want_tnum = @_ ;
+    if(@want_tnum ==0) {
+        @want_tnum = keys(%$ptr_default_ref);
+    }
+    my @ret;
+    for my $t(@want_tnum) {
+        if(exists($ptr_default_ref->{$t})) {
+            my @f = @{$ptr_default_ref->{$t}};
+            push @ret, [$t,splice @f,10];
+        }
+        else {
+            push @ret,undef;
+        }
+    }
+    return @ret;
+}
+
+
+=head2 mpr_default_values
+
+    This method returns current semi-static fields of MPR. normally this method should be called after getting first part.
+    semi-static fields are defined as fields after OPT_FLAG to HI_SPEC of MPR
+    if no argument, return array of values, each value is array ref of 
+    [ test_num, opt_flag, ..., lo_spec,hi_spec ], array element may be undef
+
+    if argument is array of test numbers, return array of array ref, 
+    the method returns same number of input argument, undef if no corresponding default value for test number
+
+
+    my @mpr_defaults = $p->mpr_default_values;
+    for my $opt_mpr(@mpr_defaults) {
+        my ($tnum,$res_scal,$llm_scal) = @$opt_ptr;
+    }
+
+    my @mpr_defaults = $p->mpr_default_values( @tnums);
+    ## scalar(@mpr_defaults) == scalar(@tnums)
+
+
+=cut
+
+sub mpr_default_values
+{
+    my $self = shift;
+    my $default_ref = $self->{_mpr_default_values};
+    # is hash ref key = tnum value 1st PTR with all fields 
+    my @want_tnum = @_ ;
+    if(@want_tnum ==0) {
+        @want_tnum = keys(%$default_ref);
+    }
+    my @ret;
+    for my $t(@want_tnum) {
+        if(exists($default_ref->{$t})) {
+            my @f = @{$default_ref->{$t}};
+            push @ret, [$t,splice @f,13];
+        }
+        else {
+            push @ret,undef;
+        }
+    }
+    return @ret;
+
+}
+
 
 =head1 AUTHOR
 
