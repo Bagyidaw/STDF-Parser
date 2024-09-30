@@ -436,10 +436,10 @@ sub new {
             ## Nibble N*1 vec
             if($pgm_icnt) {
             my $byte_cnt = int($pgm_icnt/2) + ($pgm_icnt%2);
-            push @a, [ unpack("x${consumed} h${pgm_icnt}",$data)];
+            push @a,  unpack("x${consumed} h${pgm_icnt}",$data);
             $consumed += $byte_cnt;
             } else {
-                push @a,[];
+                push @a,"";
             }
             if($consumed >= $len) { goto RETURN;}
             ## fail pin D*n
